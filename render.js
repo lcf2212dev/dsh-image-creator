@@ -381,13 +381,62 @@ async function writeSvg(markup, outPath, fallbackWidth, fallbackHeight) {
 }
 
 /**
+ * Resolve when the child process exits, or after `ms`.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function waitForExit(child, ms) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit)
+      resolve()
+    }, ms)
+    const onExit = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    child.once('exit', onExit)
+  })
+}
+
+/**
+ * Kill the browser together with its own helper processes (renderer, GPU,
+ * zygote). Chrome is spawned as a process-group leader on POSIX, so signalling
+ * the group also releases the temporary profile directory immediately.
+ * @param {import('node:child_process').ChildProcess} child
+ */
+function terminate(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  if (process.platform === 'win32' || child.pid === undefined) {
+    child.kill('SIGKILL')
+    return
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL')
+  } catch {
+    child.kill('SIGKILL')
+  }
+}
+
+/**
  * A minimal DevTools protocol client over Chrome's `--remote-debugging-pipe`
  * transport: NUL-terminated JSON messages are written to the child's fd 3 and
  * read from its fd 4.
  *
+ * The pipe `error` listeners stay attached for the whole life of the streams:
+ * killing Chrome makes the read side emit ECONNRESET, and an unhandled stream
+ * error would take the whole Host process down (for example when the user
+ * cancels a render). Errors after `close()` are therefore swallowed on purpose.
+ *
  * @param {import('node:child_process').ChildProcess} child
  * @param {{ signal?: AbortSignal, stderr: () => string }} options
- * @returns {{ send: (method: string, params?: object, sessionId?: string) => Promise<any>, waitEvent: (method: string, sessionId?: string) => Promise<any>, close: () => void }}
+ * @returns {{
+ *   send: (method: string, params?: object, sessionId?: string) => Promise<any>,
+ *   waitEvent: (method: string, sessionId?: string) => Promise<any>,
+ *   close: () => Promise<void>
+ * }}
  */
 function cdpClient(child, options) {
   const toChrome = child.stdio[3]
@@ -395,8 +444,8 @@ function cdpClient(child, options) {
   if (toChrome === null || fromChrome === null) throw new Error('create_image: the browser pipe is unavailable')
   /** @type {Map<number, { resolve: (value: any) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }>} */
   const pending = new Map()
-  /** @type {Array<(message: any) => void>} */
-  const listeners = []
+  /** @type {Set<{ listener: (message: any) => void, reject: (error: Error) => void, timer: NodeJS.Timeout | undefined }>} */
+  const eventWaiters = new Set()
   let nextId = 1
   let closed = false
   let buffer = ''
@@ -416,13 +465,24 @@ function cdpClient(child, options) {
       entry.reject(error)
     }
     pending.clear()
+    for (const waiter of eventWaiters) {
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    eventWaiters.clear()
     closed = true
   }
   const onStreamError = (error) => {
+    if (closed) return
     fail(new Error(`create_image: the browser pipe failed: ${error.message}`, { cause: error }))
+  }
+  const onChildError = (error) => {
+    if (closed) return
+    fail(new Error(`create_image: the browser process failed: ${error.message}`, { cause: error }))
   }
   toChrome.on('error', onStreamError)
   fromChrome.on('error', onStreamError)
+  child.on('error', onChildError)
   const onData = (chunk) => {
     buffer += chunk.toString('utf8')
     let index
@@ -437,7 +497,7 @@ function cdpClient(child, options) {
         continue
       }
       if (message.id === undefined) {
-        for (const listener of [...listeners]) listener(message)
+        for (const waiter of [...eventWaiters]) waiter.listener(message)
         continue
       }
       const entry = pending.get(message.id)
@@ -448,16 +508,19 @@ function cdpClient(child, options) {
       else entry.resolve(message.result)
     }
   }
-  const onExit = () => fail(exitError())
+  const onExit = () => {
+    if (!closed) fail(exitError())
+  }
   const onAbort = () => {
-    child.kill('SIGKILL')
+    if (closed) return
     fail(new Error('create_image: image rendering was cancelled'))
+    terminate(child)
   }
   fromChrome.on('data', onData)
   child.on('exit', onExit)
   options.signal?.addEventListener('abort', onAbort, { once: true })
   if (options.signal?.aborted === true) onAbort()
-  else if (child.exitCode !== null || child.signalCode !== null) fail(exitError())
+  else if (child.exitCode !== null || child.signalCode !== null) onExit()
 
   const send = (method, params = {}, sessionId) => {
     if (closed) return Promise.reject(exitError())
@@ -473,32 +536,46 @@ function cdpClient(child, options) {
     })
   }
   const waitEvent = (method, sessionId) => new Promise((resolve, reject) => {
-    const listener = (message) => {
-      if (message.method !== method) return
-      if (sessionId !== undefined && message.sessionId !== sessionId) return
-      clearTimeout(timer)
-      listeners.splice(listeners.indexOf(listener), 1)
-      resolve(message.params)
+    const waiter = {
+      /** @param {any} message */
+      listener: (message) => {
+        if (message.method !== method) return
+        if (sessionId !== undefined && message.sessionId !== sessionId) return
+        clearTimeout(waiter.timer)
+        eventWaiters.delete(waiter)
+        resolve(message.params)
+      },
+      reject,
+      /** @type {NodeJS.Timeout | undefined} */
+      timer: undefined
     }
-    const timer = setTimeout(() => {
-      listeners.splice(listeners.indexOf(listener), 1)
+    waiter.timer = setTimeout(() => {
+      eventWaiters.delete(waiter)
       reject(new Error(`create_image: the browser did not emit ${method} within ${CDP_COMMAND_TIMEOUT_MS} ms`))
     }, CDP_COMMAND_TIMEOUT_MS)
-    listeners.push(listener)
+    eventWaiters.add(waiter)
   })
-  const close = () => {
+  const close = async () => {
     closed = true
     options.signal?.removeEventListener('abort', onAbort)
-    child.removeListener('exit', onExit)
-    fromChrome.removeListener('data', onData)
-    toChrome.removeListener('error', onStreamError)
-    fromChrome.removeListener('error', onStreamError)
     for (const entry of pending.values()) {
       clearTimeout(entry.timer)
       entry.reject(new Error('create_image: the browser connection closed'))
     }
     pending.clear()
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    for (const waiter of eventWaiters) {
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+      waiter.reject(new Error('create_image: the browser connection closed'))
+    }
+    eventWaiters.clear()
+    if (child.exitCode === null && child.signalCode === null) {
+      terminate(child)
+      await waitForExit(child, 3000)
+    }
+    // Late ECONNRESET from the killed browser is expected and swallowed by the
+    // permanent stream error listeners above.
+    toChrome.destroy()
+    fromChrome.destroy()
   }
   return { send, waitEvent, close }
 }
@@ -555,7 +632,8 @@ async function captureHtml(options) {
   const profileDir = await mkdtemp(path.join(scratch, 'chrome-'))
   const stderr = { text: '' }
   const child = spawn(chrome, chromeArgs(profileDir, options.sandbox), {
-    stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32'
   })
   child.stderr?.on('data', (chunk) => {
     if (stderr.text.length >= MAX_CAPTURE_BYTES) return
@@ -581,8 +659,10 @@ async function captureHtml(options) {
     error.code = 'BROWSER_EXIT'
     throw error
   }
-  const client = cdpClient(child, { stderr: () => stderr.text, ...(signal === undefined ? {} : { signal }) })
+  /** @type {ReturnType<typeof cdpClient> | undefined} */
+  let client
   try {
+    client = cdpClient(child, { stderr: () => stderr.text, ...(signal === undefined ? {} : { signal }) })
     const targets = await client.send('Target.getTargets')
     const page = targets.targetInfos.find((target) => target.type === 'page')
     if (page === undefined) throw new Error('create_image: the browser opened no page target')
@@ -601,6 +681,10 @@ async function captureHtml(options) {
       )
     }
     const loaded = client.waitEvent('Page.loadEventFired', sessionId)
+    // If navigation itself rejects (cancellation, browser exit), `loaded` is
+    // rejected too; mark it handled so it cannot surface as an unhandled
+    // rejection that would crash the Host process.
+    loaded.catch(() => undefined)
     await client.send('Page.navigate', { url: pathToFileURL(htmlPath).href }, sessionId)
     await loaded
     const shot = await client.send(
@@ -610,7 +694,13 @@ async function captureHtml(options) {
     )
     await writeFile(pngPath, Buffer.from(shot.data, 'base64'))
   } finally {
-    client.close()
+    if (client === undefined) {
+      // cdpClient could not attach to the pipe: never leave the browser running.
+      terminate(child)
+      await waitForExit(child, 3000)
+    } else {
+      await client.close()
+    }
   }
 }
 
@@ -743,7 +833,11 @@ export async function renderDesign(options) {
       format
     }
   } finally {
-    if (scratch !== undefined) await rm(scratch, { recursive: true, force: true }).catch(() => undefined)
+    if (scratch !== undefined) {
+      // A just-killed browser can still be releasing its profile files, so retry
+      // the removal instead of leaking one scratch directory per render.
+      await rm(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }).catch(() => undefined)
+    }
   }
 }
 
