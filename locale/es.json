@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Creador de imágenes",
+    "description": "Añade la herramienta create_image: crea imágenes a partir de un texto con Claude Fable 5.2 y esfuerzo alto, y las renderiza localmente en PNG, JPEG, WebP o SVG."
+  }
+}

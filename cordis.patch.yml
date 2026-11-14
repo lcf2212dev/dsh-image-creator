@@ -1,0 +1,24 @@
+# Bundle patch for @dsh-burn-plugins/dsh-image-creator.
+#
+# Registers one Host row whose plugin contributes the `create_image` tool. The
+# tool turns a text prompt into a real image file: the visual design is handed
+# to the `claude_delegate` tool (registered by
+# @dsh-burn-plugins/dsh-claude-delegate), which returns a self-contained HTML or
+# SVG document, and this plugin renders that document locally with Chrome
+# headless or librsvg into PNG, JPEG, WebP or SVG.
+#
+# To customise it, override the row from the profile patch
+# (`<profile>/cordis.patch.yml`) instead of editing this file:
+#
+#   - id: image-creator
+#     name: "@dsh-burn-plugins/dsh-image-creator"
+#     config:
+#       model: fable
+#       effort: high
+#       width: 1024
+#       height: 1024
+#       directory: created-images
+- insert:
+    - id: image-creator
+      name: '@dsh-burn-plugins/dsh-image-creator'
+      config: {}

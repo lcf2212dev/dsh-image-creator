@@ -1,0 +1,32 @@
+{
+  "name": "@dsh-burn-plugins/dsh-image-creator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Adds the create_image tool: creates an image from a text prompt with the claude_delegate tool on Claude Fable 5.2 at high effort and renders it locally to PNG, JPEG, WebP or SVG.",
+  "exports": {
+    ".": "./index.js",
+    "./render": "./render.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "render.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1",
+    "@deepseek-ai/schemastery": ">=3.19.0 <4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

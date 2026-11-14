@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Bildersteller",
+    "description": "Fügt das Tool create_image hinzu: erstellt Bilder aus einer Textbeschreibung mit Claude Fable 5.2 bei hohem Aufwand und rendert sie lokal als PNG, JPEG, WebP oder SVG."
+  }
+}

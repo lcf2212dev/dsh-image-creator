@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "画像クリエイター",
+    "description": "create_image ツールを追加します。テキストから Claude Fable 5.2（high エフォート）で画像を作成し、PNG・JPEG・WebP・SVG としてローカルにレンダリングします。"
+  }
+}
