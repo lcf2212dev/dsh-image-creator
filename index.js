@@ -38,6 +38,8 @@ const MIN_DIMENSION = 16
 const MAX_DIMENSION = 4096
 /** Longest prompt forwarded to the designer. */
 const MAX_PROMPT = 6000
+/** Result-line labels for the output formats. */
+const FORMAT_LABELS = { png: 'PNG', jpg: 'JPEG', webp: 'WebP', svg: 'SVG' }
 
 export const Config = z.object({
   /** Model alias handed to claude_delegate; Fable 5.2 is the CLI's `fable` alias. */
@@ -197,7 +199,7 @@ function outputPath(directory, requested, format, prompt, folder) {
     if (extension === '') return `${absolute}.${format}`
     return absolute
   }
-  const name = `${slug(prompt) || 'image'}-${timestamp()}.${format}`
+  const name = `${slug(prompt) || 'image'}-${timestamp()}-${randomUUID().slice(0, 4)}.${format}`
   return path.resolve(directory, folder === '' ? 'created-images' : folder, name)
 }
 
@@ -320,7 +322,7 @@ export function apply(ctx, config) {
         },
         format: {
           type: 'string',
-          enum: ['png', 'jpg', 'webp', 'svg'],
+          enum: ['png', 'jpg', 'jpeg', 'webp', 'svg'],
           description:
             'Output format. Default: the path extension when `path` is given, otherwise png. JPEG and WebP are flattened/compressed; SVG keeps the vector document.'
         },
@@ -352,7 +354,6 @@ export function apply(ctx, config) {
         const format = resolveFormat(args.format, args.path)
         const directory = await sessionDirectory(ctx, exec)
         const target = outputPath(directory, args.path, format, prompt, config.directory ?? 'created-images')
-        await mkdir(path.dirname(target), { recursive: true })
 
         if (ctx.tools.get(DELEGATE_TOOL, exec.agent) === undefined) {
           throw new Error(
@@ -402,6 +403,7 @@ export function apply(ctx, config) {
           )
         }
 
+        await mkdir(path.dirname(target), { recursive: true })
         const image = await renderDesign({
           design,
           outPath: target,
@@ -415,7 +417,7 @@ export function apply(ctx, config) {
 
         const lines = [
           `Created image: ${target}`,
-          `${image.width}×${image.height} ${image.format.toUpperCase()}, ${humanBytes(image.bytes)}`
+          `${image.width}×${image.height} ${FORMAT_LABELS[image.format] ?? image.format.toUpperCase()}, ${humanBytes(image.bytes)}`
         ]
         if (design.note !== '') lines.push(`Design: ${design.note}`)
         return lines.join('\n')
@@ -435,7 +437,7 @@ export function apply(ctx, config) {
 
   if (config.blockGenerators !== false && typeof ctx.tools.guard === 'function') {
     ctx.tools.guard((exec) => {
-      if (!/^(?:mcp__[^_]+(?:__[^_]+)*__)?generate_(?:image|vector_illustration)$/.test(exec.name)) return undefined
+      if (!/(?:^|__)generate_(?:image|vector_illustration)$/.test(exec.name)) return undefined
       return 'Images in this profile are created by the dsh-image-creator plugin: call create_image instead, which designs the image and writes a PNG, JPEG, WebP or SVG file in the workspace.'
     })
   }

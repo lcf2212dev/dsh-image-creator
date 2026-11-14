@@ -15,9 +15,12 @@
 #     config:
 #       model: fable
 #       effort: high
+#       readOnly: true
 #       width: 1024
 #       height: 1024
 #       directory: created-images
+#       chromePath: ''
+#       blockGenerators: true
 - insert:
     - id: image-creator
       name: '@dsh-burn-plugins/dsh-image-creator'

@@ -20,11 +20,12 @@ import { constants } from 'node:fs'
 import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 /** Captured stdout/stderr per stream before the tail is dropped. */
 const MAX_CAPTURE_BYTES = 256 * 1024
-/** Upper bound for one Chrome screenshot. */
-const CHROME_TIMEOUT_MS = 120_000
+/** Upper bound for one DevTools protocol command. */
+const CDP_COMMAND_TIMEOUT_MS = 20_000
 /** Upper bound for one raster/convert command. */
 const RASTER_TIMEOUT_MS = 60_000
 /** Formats this plugin can write. */
@@ -276,8 +277,10 @@ function htmlSpan(candidate) {
 export function extractDesign(text, preferred) {
   const candidates = [...fencedBlocks(text), text]
   const kinds = preferred === 'svg' ? ['svg', 'html'] : ['html', 'svg']
-  for (const candidate of candidates) {
-    for (const kind of kinds) {
+  // The preferred kind wins across every candidate before the other kind is
+  // considered: a small inline SVG snippet must not shadow the real document.
+  for (const kind of kinds) {
+    for (const candidate of candidates) {
       const markup = kind === 'svg' ? svgSpan(candidate) : htmlSpan(candidate)
       if (markup !== undefined) return { kind, markup, note: designNote(text) }
     }
@@ -326,29 +329,304 @@ export function frameHtml(markup, width, height, transparent) {
   return `<!doctype html><html><head>${frame}</head><body>${html}</body></html>`
 }
 
-/** Chrome flags for a deterministic local screenshot. @param {object} options @returns {string[]} */
-function chromeArgs({ width, height, pngPath, htmlPath, profileDir, transparent }) {
+/**
+ * Read the declared pixel size from an SVG document.
+ * @param {string} markup
+ * @returns {{ width?: number, height?: number }}
+ */
+function svgDimensions(markup) {
+  const tag = markup.match(/<svg\b[^>]*>/i)?.[0] ?? ''
+  const numberAttribute = (name) => {
+    const raw = tag.match(new RegExp(`\\b${name}\\s*=\\s*["']\\s*([\\d.]+)`, 'i'))?.[1]
+    return raw === undefined ? undefined : Math.round(Number(raw))
+  }
+  const width = numberAttribute('width')
+  const height = numberAttribute('height')
+  if (width !== undefined && height !== undefined) return { width, height }
+  const viewBox = tag.match(/\bviewBox\s*=\s*["']\s*([\d.\s-]+)["']/i)?.[1]
+  if (viewBox !== undefined) {
+    const parts = viewBox.trim().split(/[\s,]+/).map(Number)
+    if (parts.length === 4 && parts.every(Number.isFinite)) {
+      return { width: Math.round(parts[2]), height: Math.round(parts[3]) }
+    }
+  }
+  return {}
+}
+
+/**
+ * Validate and write one SVG document, reporting its declared pixel size.
+ * @param {string} markup
+ * @param {string} outPath
+ * @param {number} fallbackWidth
+ * @param {number} fallbackHeight
+ * @returns {Promise<{ bytes: number, width: number, height: number, format: string }>}
+ */
+async function writeSvg(markup, outPath, fallbackWidth, fallbackHeight) {
+  const document = markup.trim()
+  const withoutDeclaration = document.replace(/^<\?xml[^>]*>\s*/i, '')
+  if (!/^<svg\b/i.test(withoutDeclaration) || !/<\/svg>$/i.test(document)) {
+    throw new Error('create_image: the designer returned an incomplete SVG document')
+  }
+  const bytes = Buffer.byteLength(document)
+  await writeFile(outPath, document, 'utf8')
+  const written = await readFile(outPath, 'utf8')
+  if (written !== document) throw new Error('create_image: the SVG file could not be written completely')
+  const dimensions = svgDimensions(document)
+  return {
+    bytes,
+    width: dimensions.width ?? fallbackWidth,
+    height: dimensions.height ?? fallbackHeight,
+    format: 'svg'
+  }
+}
+
+/**
+ * A minimal DevTools protocol client over Chrome's `--remote-debugging-pipe`
+ * transport: NUL-terminated JSON messages are written to the child's fd 3 and
+ * read from its fd 4.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{ signal?: AbortSignal, stderr: () => string }} options
+ * @returns {{ send: (method: string, params?: object, sessionId?: string) => Promise<any>, waitEvent: (method: string, sessionId?: string) => Promise<any>, close: () => void }}
+ */
+function cdpClient(child, options) {
+  const toChrome = child.stdio[3]
+  const fromChrome = child.stdio[4]
+  if (toChrome === null || fromChrome === null) throw new Error('create_image: the browser pipe is unavailable')
+  /** @type {Map<number, { resolve: (value: any) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }>} */
+  const pending = new Map()
+  /** @type {Array<(message: any) => void>} */
+  const listeners = []
+  let nextId = 1
+  let closed = false
+  let buffer = ''
+
+  const exitError = () => {
+    const detail = tail(options.stderr())
+    const error = new Error(
+      `create_image: the browser exited before answering${detail === '' ? '' : `: ${detail}`}`
+    )
+    // @ts-expect-error custom discriminator for the sandbox retry.
+    error.code = 'BROWSER_EXIT'
+    return error
+  }
+  const fail = (error) => {
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer)
+      entry.reject(error)
+    }
+    pending.clear()
+    closed = true
+  }
+  const onStreamError = (error) => {
+    fail(new Error(`create_image: the browser pipe failed: ${error.message}`, { cause: error }))
+  }
+  toChrome.on('error', onStreamError)
+  fromChrome.on('error', onStreamError)
+  const onData = (chunk) => {
+    buffer += chunk.toString('utf8')
+    let index
+    while ((index = buffer.indexOf('\0')) !== -1) {
+      const raw = buffer.slice(0, index)
+      buffer = buffer.slice(index + 1)
+      if (raw.trim() === '') continue
+      let message
+      try {
+        message = JSON.parse(raw)
+      } catch {
+        continue
+      }
+      if (message.id === undefined) {
+        for (const listener of [...listeners]) listener(message)
+        continue
+      }
+      const entry = pending.get(message.id)
+      if (entry === undefined) continue
+      pending.delete(message.id)
+      clearTimeout(entry.timer)
+      if (message.error !== undefined) entry.reject(new Error(`create_image: the browser rejected ${message.method ?? 'a command'}: ${JSON.stringify(message.error)}`))
+      else entry.resolve(message.result)
+    }
+  }
+  const onExit = () => fail(exitError())
+  const onAbort = () => {
+    child.kill('SIGKILL')
+    fail(new Error('create_image: image rendering was cancelled'))
+  }
+  fromChrome.on('data', onData)
+  child.on('exit', onExit)
+  options.signal?.addEventListener('abort', onAbort, { once: true })
+  if (options.signal?.aborted === true) onAbort()
+  else if (child.exitCode !== null || child.signalCode !== null) fail(exitError())
+
+  const send = (method, params = {}, sessionId) => {
+    if (closed) return Promise.reject(exitError())
+    const id = nextId
+    nextId += 1
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error(`create_image: the browser did not answer ${method} within ${CDP_COMMAND_TIMEOUT_MS} ms`))
+      }, CDP_COMMAND_TIMEOUT_MS)
+      pending.set(id, { resolve, reject, timer })
+      toChrome.write(`${JSON.stringify({ id, method, params, ...(sessionId === undefined ? {} : { sessionId }) })}\0`)
+    })
+  }
+  const waitEvent = (method, sessionId) => new Promise((resolve, reject) => {
+    const listener = (message) => {
+      if (message.method !== method) return
+      if (sessionId !== undefined && message.sessionId !== sessionId) return
+      clearTimeout(timer)
+      listeners.splice(listeners.indexOf(listener), 1)
+      resolve(message.params)
+    }
+    const timer = setTimeout(() => {
+      listeners.splice(listeners.indexOf(listener), 1)
+      reject(new Error(`create_image: the browser did not emit ${method} within ${CDP_COMMAND_TIMEOUT_MS} ms`))
+    }, CDP_COMMAND_TIMEOUT_MS)
+    listeners.push(listener)
+  })
+  const close = () => {
+    closed = true
+    options.signal?.removeEventListener('abort', onAbort)
+    child.removeListener('exit', onExit)
+    fromChrome.removeListener('data', onData)
+    toChrome.removeListener('error', onStreamError)
+    fromChrome.removeListener('error', onStreamError)
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer)
+      entry.reject(new Error('create_image: the browser connection closed'))
+    }
+    pending.clear()
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  }
+  return { send, waitEvent, close }
+}
+
+/**
+ * Chrome flags for one headless render.
+ *
+ * The viewport is set through `Emulation.setDeviceMetricsOverride`, not through
+ * `--window-size`: some Chrome builds clamp the headless window and lay the page
+ * out in a smaller viewport while still writing a screenshot of the requested
+ * size, which silently clipped content near the bottom or right edge. The page
+ * also gets no network access.
+ *
+ * @param {string} profileDir
+ * @param {boolean} sandbox
+ * @returns {string[]}
+ */
+function chromeArgs(profileDir, sandbox) {
   return [
     '--headless=new',
     '--disable-gpu',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
+    ...(sandbox ? [] : ['--no-sandbox', '--disable-setuid-sandbox']),
     '--disable-dev-shm-usage',
     '--disable-extensions',
     '--disable-background-networking',
+    '--host-resolver-rules=MAP * 0.0.0.0',
+    '--mute-audio',
     '--hide-scrollbars',
     '--no-first-run',
     '--no-default-browser-check',
     '--force-color-profile=srgb',
     '--force-device-scale-factor=1',
-    '--run-all-compositor-stages-before-draw',
-    '--virtual-time-budget=1500',
-    ...(transparent ? ['--default-background-color=00000000'] : []),
+    '--remote-debugging-pipe',
     `--user-data-dir=${profileDir}`,
-    `--window-size=${width},${height}`,
-    `--screenshot=${pngPath}`,
-    `file://${htmlPath}`
+    'about:blank'
   ]
+}
+
+/**
+ * Render one local HTML file at exactly width×height into a PNG.
+ * @param {object} options
+ * @param {string} options.chrome
+ * @param {string} options.htmlPath
+ * @param {string} options.pngPath
+ * @param {number} options.width
+ * @param {number} options.height
+ * @param {boolean} options.transparent
+ * @param {boolean} options.sandbox
+ * @param {string} options.scratch
+ * @param {AbortSignal} [options.signal]
+ */
+async function captureHtml(options) {
+  const { chrome, htmlPath, pngPath, width, height, transparent, scratch, signal } = options
+  const profileDir = await mkdtemp(path.join(scratch, 'chrome-'))
+  const stderr = { text: '' }
+  const child = spawn(chrome, chromeArgs(profileDir, options.sandbox), {
+    stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe']
+  })
+  child.stderr?.on('data', (chunk) => {
+    if (stderr.text.length >= MAX_CAPTURE_BYTES) return
+    stderr.text += chunk.toString('utf8').slice(0, MAX_CAPTURE_BYTES - stderr.text.length)
+  })
+  const started = new Promise((resolve, reject) => {
+    child.once('spawn', resolve)
+    child.once('error', (error) => {
+      reject(new Error(`create_image: the browser could not start: ${error.message}`, { cause: error }))
+    })
+  })
+  /** @type {{ code: number | null, signal: string | null } | undefined} */
+  let earlyExit
+  child.once('exit', (code, exitSignal) => {
+    earlyExit = { code, signal: exitSignal }
+  })
+  await started
+  if (earlyExit !== undefined) {
+    const error = new Error(
+      `create_image: the browser exited at startup (${earlyExit.code ?? earlyExit.signal})${tail(stderr.text) === '' ? '' : `: ${tail(stderr.text)}`}`
+    )
+    // @ts-expect-error custom discriminator for the sandbox retry.
+    error.code = 'BROWSER_EXIT'
+    throw error
+  }
+  const client = cdpClient(child, { stderr: () => stderr.text, ...(signal === undefined ? {} : { signal }) })
+  try {
+    const targets = await client.send('Target.getTargets')
+    const page = targets.targetInfos.find((target) => target.type === 'page')
+    if (page === undefined) throw new Error('create_image: the browser opened no page target')
+    const { sessionId } = await client.send('Target.attachToTarget', { targetId: page.targetId, flatten: true })
+    await client.send('Page.enable', {}, sessionId)
+    await client.send(
+      'Emulation.setDeviceMetricsOverride',
+      { width, height, deviceScaleFactor: 1, mobile: false },
+      sessionId
+    )
+    if (transparent) {
+      await client.send(
+        'Emulation.setDefaultBackgroundColorOverride',
+        { color: { r: 0, g: 0, b: 0, a: 0 } },
+        sessionId
+      )
+    }
+    const loaded = client.waitEvent('Page.loadEventFired', sessionId)
+    await client.send('Page.navigate', { url: pathToFileURL(htmlPath).href }, sessionId)
+    await loaded
+    const shot = await client.send(
+      'Page.captureScreenshot',
+      { format: 'png', clip: { x: 0, y: 0, width, height, scale: 1 }, fromSurface: true },
+      sessionId
+    )
+    await writeFile(pngPath, Buffer.from(shot.data, 'base64'))
+  } finally {
+    client.close()
+  }
+}
+
+/**
+ * Capture HTML, retrying once without the Chrome sandbox when the first attempt
+ * cannot start (root/container environments disable the setuid sandbox).
+ * @param {Parameters<typeof captureHtml>[0]} options
+ */
+async function renderHtml(options) {
+  try {
+    await captureHtml({ ...options, sandbox: true })
+  } catch (error) {
+    // @ts-expect-error custom discriminator set by cdpClient/captureHtml.
+    if (error?.code !== 'BROWSER_EXIT') throw error
+    await captureHtml({ ...options, sandbox: false })
+  }
 }
 
 /** Write-and-render scratch directory. @returns {Promise<string>} */
@@ -381,10 +659,7 @@ export async function renderDesign(options) {
       if (design.kind !== 'svg') {
         throw new Error('create_image: the designer returned HTML, but an SVG file was requested')
       }
-      const bytes = Buffer.byteLength(design.markup)
-      if (bytes === 0) throw new Error('create_image: the designer returned an empty SVG document')
-      await writeFile(outPath, design.markup, 'utf8')
-      return { bytes, width, height, format: 'svg' }
+      return await writeSvg(design.markup, outPath, width, height)
     }
 
     const pngPath = path.join(scratch, 'render.png')
@@ -394,10 +669,11 @@ export async function renderDesign(options) {
       await writeFile(sourcePath, design.markup, 'utf8')
       const rsvg = await executable('rsvg-convert')
       if (rsvg !== undefined) {
-        rendererRun = await run(rsvg, ['-w', String(width), '-h', String(height), '-o', pngPath, sourcePath], {
-          timeoutMs: RASTER_TIMEOUT_MS,
-          ...(signal === undefined ? {} : { signal })
-        })
+        rendererRun = await run(
+          rsvg,
+          ['-w', String(width), '-h', String(height), ...(transparent ? [] : ['-b', 'white']), '-o', pngPath, sourcePath],
+          { timeoutMs: RASTER_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }
+        )
         assertRan('svg rendering (rsvg-convert)', rendererRun)
       } else {
         const magick = (await executable('magick')) ?? (await executable('convert'))
@@ -406,7 +682,17 @@ export async function renderDesign(options) {
         }
         rendererRun = await run(
           magick,
-          ['-background', 'none', '-density', '192', sourcePath, '-resize', `${width}x${height}!`, pngPath],
+          [
+            '-background',
+            transparent ? 'none' : 'white',
+            '-density',
+            '192',
+            sourcePath,
+            ...(transparent ? [] : ['-alpha', 'remove', '-alpha', 'off']),
+            '-resize',
+            `${width}x${height}!`,
+            pngPath
+          ],
           { timeoutMs: RASTER_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }
         )
         assertRan('svg rendering (ImageMagick)', rendererRun)
@@ -420,13 +706,16 @@ export async function renderDesign(options) {
       }
       const html = frameHtml(design.markup, width, height, transparent)
       await writeFile(sourcePath, html, 'utf8')
-      const profileDir = path.join(scratch, 'chrome-profile')
-      rendererRun = await run(
+      await renderHtml({
         chrome,
-        chromeArgs({ width, height, pngPath, htmlPath: sourcePath, profileDir, transparent }),
-        { timeoutMs: CHROME_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }
-      )
-      assertRan('HTML rendering (Chrome headless)', rendererRun)
+        htmlPath: sourcePath,
+        pngPath,
+        width,
+        height,
+        transparent,
+        scratch,
+        ...(signal === undefined ? {} : { signal })
+      })
     }
 
     if (!(await isFile(pngPath))) {
